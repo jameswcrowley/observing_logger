@@ -14,12 +14,27 @@ from reportlab.platypus import (
 )
 from reportlab.lib.styles import getSampleStyleSheet
 
+from astropy.time import Time
+import numpy
+import matplotlib.pyplot as plt
+from sunpy.net import Fido, attrs as a
+import astropy.units as u
+from sunpy import map as map
 
 class Config:
-    def __init__(self, DB_NAME="observing_logs.db", db_save_path=None, pdf_save_path=None):
+    def __init__(self, DB_NAME="observing_logs.db",
+                  db_save_path=None, 
+                  pdf_save_path=None,
+                  verbose = False,
+                  use_HMI = True,
+                  default_observer = None):
+        
         self.DB_NAME = DB_NAME
         self.db_save_path = db_save_path
         self.pdf_save_path = pdf_save_path
+        self.use_HMI = use_HMI
+        self.verbose = verbose
+        self.default_observer = default_observer
 
 
 class DatabaseManager:
@@ -117,11 +132,13 @@ class DatabaseManager:
 
         log_id, existing_notes = row
 
-        if existing_notes:
-            # TODO: this is not actually adding new notes to a new line. 
-            combined_notes = f"{existing_notes}\n{new_note}"
+        if existing_notes and existing_notes.strip():
+            # Keep exactly one line break between old and new note blocks.
+            combined_notes = (
+                f"{existing_notes.rstrip()}\n{new_note.strip()}"
+            )
         else:
-            combined_notes = new_note
+            combined_notes = new_note.strip()
 
         cur.execute(
             """
@@ -161,6 +178,86 @@ class DatabaseManager:
 
         conn.close()
         return rows
+    
+class HMI_data_plotter:
+    """
+    load and plot the HMI files closest to the specified time, delete the HMI file locally afterwards.
+    """
+
+    def __init__(self, cfg, time):
+        self.cfg = cfg
+        self.time = time
+
+    def load_hmi(self, time: Time):
+        """
+        Downloads all HMI data within one minute of the passed time interval
+
+        Parameters:
+        -----------
+        start_time (Time): The start time of the interval
+        end_time (Time): The end time of the interval
+
+        ** Currently only reads in middle file, not all related files **
+        """
+        search_results = Fido.search(
+            a.Instrument.hmi,
+            a.Physobs("intensity"),
+            a.Time(time - 1 * u.minute, time + 1 * u.minute),
+        )
+        path_to_sunpy = "~/sunpy/data/observing_logger/"
+
+        hmi_files = Fido.fetch(
+            search_results, path=path_to_sunpy, progress=self.cfg.verbose, site="NSO"
+        )
+
+        if hmi_files == []:
+            raise FileNotFoundError("No HMI files found for the specified time interval.")
+
+        # read in the middle file using scipy.map to extract the coordinates and data.
+        hmi = map.Map(hmi_files[0])
+
+        # read in the x and y coordinates as seperate arrays.
+        hmix = map.all_coordinates_from_map(hmi).Tx
+        hmiy = map.all_coordinates_from_map(hmi).Ty
+        
+        # read in the intensity data as a 2D array.  
+        hmi_data = hmi.data
+        hmi_data /= np.max(hmi.data)
+
+        image_time = hmi.date
+
+        return hmix, hmiy, hmi_data, image_time
+    
+    def plot_hmi(self, hmix, hmiy, hmi_data, image_time):
+        """
+        Plots the HMI data using matplotlib.
+
+        Parameters:
+        -----------
+        hmix (ndarray): X coordinates of the HMI data
+        hmiy (ndarray): Y coordinates of the HMI data
+        hmi_data (ndarray): 2D array of HMI intensity data
+        image_time (Time): The time of the HMI image
+        """
+        plt.figure(figsize=(8, 8))
+        plt.imshow(hmi_data, extent=[hmix.min(), hmix.max(), hmiy.min(), hmiy.max()], origin='lower', cmap='gray')
+        plt.colorbar(label='Intensity')
+        plt.title(f'HMI Image at {image_time}')
+        plt.xlabel('X [arcsec]')
+        plt.ylabel('Y [arcsec]')
+        plt.show()
+
+
+    def load_and_plot_HMI(self):
+        """
+        Loads and plots the HMI data for the time around the instance's time attribute.
+
+        This method automatically sets the time interval to one minute before and after the instance's time.
+        """
+        hmix, hmiy, hmi_data, image_time = self.load_hmi(self.time)
+        self.plot_hmi(hmix, hmiy, hmi_data, image_time)
+
+    
 
 
 class ObservingLogApp:
@@ -260,6 +357,7 @@ class ObservingLogApp:
             command=self.add_hmi_image
         ).pack(side="left", padx=5)
 
+
     def save_log(self):
         target = self.target_entry.get().strip()
 
@@ -348,10 +446,18 @@ class ObservingLogApp:
     def add_hmi_image(self):
         # TODO: Add image-selection workflow (for example, file picker dialog).
         # TODO: Add persistence for image metadata/storage and attach to a log.
-        messagebox.showinfo(
-            "Not Implemented",
-            "'Add HMI Image' functionality will be added in a future update."
-        )
+        if not self.cfg.use_HMI:
+            messagebox.showwarning(
+                "HMI Disabled",
+                "HMI functionality is disabled in the current configuration."
+            )
+            #return
+        else:
+            # Placeholder for future HMI image handling logic
+            local_time = Time(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            hmi_plotter = HMI_data_plotter(self.cfg, local_time)
+            hmi_plotter.load_and_plot_HMI()
+            
 
     def view_logs(self):
         rows = self.db.get_all_logs()
@@ -521,7 +627,7 @@ class ObservingLogApp:
 
                 content.append(
                     Paragraph(
-                        f"<b>Notes:</b><br/>{notes}",
+                        f"<b>Notes:</b><br/>{(notes or '').replace(chr(10), '<br/>')}",
                         styles["Normal"]
                     )
                 )
@@ -543,7 +649,8 @@ class ObservingLogApp:
 
 
 def main():
-    cfg = Config()
+    cfg = Config(use_HMI = False,
+                 default_observer="James Crowley")
 
     root = Tk()
     app = ObservingLogApp(cfg, root)
