@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime, timezone
 from tkinter import (
     Tk, Toplevel, Frame, Label, Entry, Text,
-    Button, StringVar, END, messagebox
+    Button, StringVar, END, messagebox, filedialog
 )
 from tkinter import ttk
 
@@ -10,30 +10,37 @@ from reportlab.platypus import (
     SimpleDocTemplate,
     Paragraph,
     Spacer,
-    PageBreak
+    Image as RLImage,
 )
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 
+
+# plotting gong stuff: 
 from astropy.time import Time
 import numpy
 import matplotlib.pyplot as plt
 from sunpy.net import Fido, attrs as a
 import astropy.units as u
 from sunpy import map as map
+import os
+import numpy as np
+from matplotlib.widgets import Button as MplButton
+from matplotlib.patches import Rectangle
 
 class Config:
     def __init__(self, DB_NAME="observing_logs.db",
                   db_save_path=None, 
                   pdf_save_path=None,
                   verbose = False,
-                  use_HMI = True,
+                  use_gong = True,
                   default_observer = None):
         
         self.DB_NAME = DB_NAME
         self.db_save_path = db_save_path
         self.pdf_save_path = pdf_save_path
-        self.use_HMI = use_HMI
         self.verbose = verbose
+        self.use_gong = use_gong
         self.default_observer = default_observer
 
 
@@ -65,8 +72,24 @@ class DatabaseManager:
             """
         )
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS log_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (log_id) REFERENCES logs(id)
+            )
+            """
+        )
+
         conn.commit()
         conn.close()
+
+    def set_database(self, db_name):
+        self.db_name = db_name
+        self.initialize_database()
 
     def add_log(
         self,
@@ -153,6 +176,58 @@ class DatabaseManager:
         conn.close()
         return True
 
+    def add_image_to_last_log(self, image_path):
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT id
+            FROM logs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+
+        row = cur.fetchone()
+
+        if not row:
+            conn.close()
+            return False
+
+        log_id = row[0]
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        cur.execute(
+            """
+            INSERT INTO log_images (log_id, image_path, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (log_id, image_path, created_at),
+        )
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def get_images_for_log(self, log_id):
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT image_path
+            FROM log_images
+            WHERE log_id = ?
+            ORDER BY id ASC
+            """,
+            (log_id,),
+        )
+
+        rows = cur.fetchall()
+        conn.close()
+        return [row[0] for row in rows]
+
     def get_all_logs(self):
         conn = sqlite3.connect(self.db_name)
         cur = conn.cursor()
@@ -179,16 +254,15 @@ class DatabaseManager:
         conn.close()
         return rows
     
-class HMI_data_plotter:
+class gong_data_plotter:
     """
-    load and plot the HMI files closest to the specified time, delete the HMI file locally afterwards.
+    load and plot the GONG files closest to the specified time, delete the GONG file locally afterwards.
     """
 
-    def __init__(self, cfg, time):
+    def __init__(self, cfg):
         self.cfg = cfg
-        self.time = time
 
-    def load_hmi(self, time: Time):
+    def load_gong(self):
         """
         Downloads all HMI data within one minute of the passed time interval
 
@@ -199,63 +273,198 @@ class HMI_data_plotter:
 
         ** Currently only reads in middle file, not all related files **
         """
+        time = Time.now()
         search_results = Fido.search(
-            a.Instrument.hmi,
+            a.Instrument.bigbear,
             a.Physobs("intensity"),
-            a.Time(time - 1 * u.minute, time + 1 * u.minute),
+            a.Time(time - 10 * u.minute, time + 1 * u.minute),
         )
+
+        if len(search_results[0]) == 0:
+            search_results = Fido.search(
+            a.Instrument.learmonth,
+            a.Physobs("intensity"),
+            a.Time(time - 10 * u.minute, time + 1 * u.minute),
+        )
+
+        if len(search_results[0]) == 0:
+            raise FileNotFoundError("No GONG files found for the specified time interval.")
+
         path_to_sunpy = "~/sunpy/data/observing_logger/"
 
-        hmi_files = Fido.fetch(
-            search_results, path=path_to_sunpy, progress=self.cfg.verbose, site="NSO"
+
+        print(50 * '-')
+        print(f'Loading GONG file: {str(search_results[0][-1][0])}')
+
+        gong_file = Fido.fetch(
+            search_results[0][-1], path=path_to_sunpy, progress=True, site="NSO"
         )
 
-        if hmi_files == []:
-            raise FileNotFoundError("No HMI files found for the specified time interval.")
+        print(50 * '-')
 
-        # read in the middle file using scipy.map to extract the coordinates and data.
-        hmi = map.Map(hmi_files[0])
+        if gong_file == []:
+            raise FileNotFoundError("Can not open GONG file.")
 
-        # read in the x and y coordinates as seperate arrays.
-        hmix = map.all_coordinates_from_map(hmi).Tx
-        hmiy = map.all_coordinates_from_map(hmi).Ty
-        
-        # read in the intensity data as a 2D array.  
-        hmi_data = hmi.data
-        hmi_data /= np.max(hmi.data)
+        # read in the middle file using sunpy.map to extract the coordinates and data.
+        gong = map.Map(gong_file[0])
+        gong_data = np.divide(gong.data, np.nanmean(gong.data))
+        image_time = gong.date
 
-        image_time = hmi.date
-
-        return hmix, hmiy, hmi_data, image_time
+        return gong_data, image_time, gong_file
     
-    def plot_hmi(self, hmix, hmiy, hmi_data, image_time):
+    def plot_gong(self, gong_data, image_time):
         """
-        Plots the HMI data using matplotlib.
+        Plots the GONG data using matplotlib.
 
         Parameters:
         -----------
-        hmix (ndarray): X coordinates of the HMI data
-        hmiy (ndarray): Y coordinates of the HMI data
-        hmi_data (ndarray): 2D array of HMI intensity data
-        image_time (Time): The time of the HMI image
+        gong_data (ndarray): 2D array of GONG intensity data
+        image_time (Time): The time of the GONG image
         """
-        plt.figure(figsize=(8, 8))
-        plt.imshow(hmi_data, extent=[hmix.min(), hmix.max(), hmiy.min(), hmiy.max()], origin='lower', cmap='gray')
-        plt.colorbar(label='Intensity')
-        plt.title(f'HMI Image at {image_time}')
-        plt.xlabel('X [arcsec]')
-        plt.ylabel('Y [arcsec]')
+        save_time = Time(image_time).strftime("%Y%m%d_%H%M%S")
+        image_path = os.path.abspath(f"gong_image_{save_time}.png")
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        plt.subplots_adjust(bottom=0.12)
+
+        im = ax.imshow(
+            gong_data,
+            vmin=0.8,
+            vmax=2,
+            cmap="gray",
+            origin="lower",
+            extent=[-1000, 1000, -1000, 1000],
+        )
+        ax.set_title(f"GONG Image at {image_time}")
+        ax.set_xlabel("X [arcsec]")
+        ax.set_ylabel("Y [arcsec]")
+
+        boxes = []
+        first_corner = {"x": None, "y": None}
+        saved = {"done": False}
+
+        def save_clean_figure():
+            # Hide helper controls/instructions so the exported image contains only plot content.
+            clear_ax.set_visible(False)
+            save_ax.set_visible(False)
+            help_text.set_visible(False)
+            fig.savefig(image_path, dpi=150, bbox_inches="tight")
+
+        def clear_boxes(_event):
+            first_corner["x"] = None
+            first_corner["y"] = None
+
+            for patch in list(boxes):
+                patch.remove()
+
+            boxes.clear()
+            fig.canvas.draw_idle()
+
+        def save_and_close(_event):
+            save_clean_figure()
+            saved["done"] = True
+            plt.close(fig)
+
+        def on_click(event):
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+
+            # Left click: place two corners to create a red box.
+            if event.button == 1:
+                if first_corner["x"] is None:
+                    first_corner["x"] = event.xdata
+                    first_corner["y"] = event.ydata
+                    return
+
+                x0 = first_corner["x"]
+                y0 = first_corner["y"]
+                x1 = event.xdata
+                y1 = event.ydata
+
+                rect = Rectangle(
+                    (min(x0, x1), min(y0, y1)),
+                    abs(x1 - x0),
+                    abs(y1 - y0),
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=2,
+                )
+                ax.add_patch(rect)
+                boxes.append(rect)
+
+                first_corner["x"] = None
+                first_corner["y"] = None
+                fig.canvas.draw_idle()
+
+            # Right click inside a box: remove the top-most matching box.
+            elif event.button == 3:
+                for rect in reversed(boxes):
+                    bbox = rect.get_bbox()
+                    if (
+                        bbox.xmin <= event.xdata <= bbox.xmax
+                        and bbox.ymin <= event.ydata <= bbox.ymax
+                    ):
+                        rect.remove()
+                        boxes.remove(rect)
+                        fig.canvas.draw_idle()
+                        break
+
+        def on_close(_event):
+            if not saved["done"]:
+                save_clean_figure()
+
+        clear_ax = fig.add_axes([0.62, 0.02, 0.15, 0.05])
+        clear_button = MplButton(clear_ax, "Clear Boxes")
+        clear_button.on_clicked(clear_boxes)
+
+        save_ax = fig.add_axes([0.79, 0.02, 0.17, 0.05])
+        save_button = MplButton(save_ax, "Save & Close")
+        save_button.on_clicked(save_and_close)
+
+        fig.canvas.mpl_connect("button_press_event", on_click)
+        fig.canvas.mpl_connect("close_event", on_close)
+
+        help_text = fig.text(
+            0.02,
+            0.02,
+            "Left click twice to add box | Right click inside box to remove",
+            fontsize=9,
+        )
+
         plt.show()
 
+        if not os.path.exists(image_path):
+            save_clean_figure()
 
-    def load_and_plot_HMI(self):
-        """
-        Loads and plots the HMI data for the time around the instance's time attribute.
+        return image_path
 
-        This method automatically sets the time interval to one minute before and after the instance's time.
+
+    def delete_gong_file(self, gong_file):
         """
-        hmix, hmiy, hmi_data, image_time = self.load_hmi(self.time)
-        self.plot_hmi(hmix, hmiy, hmi_data, image_time)
+        Deletes the specified GONG FITS files from the local storage.
+
+        Parameters:
+        -----------
+        gong_file (list): List of paths to the GONG FITS files to be deleted
+        """
+        for file in gong_file:
+            if os.path.exists(file):
+                os.remove(file)
+            else:
+                # this will trigger every time I save a new plot, so don't need an error message here. 
+                pass
+
+    
+    def plot_and_delete_gong(self, gong_data, image_time, gong_file):
+        """
+        Loads and plots the GONG data for the time around the instance's time attribute.
+
+        This method automatically sets the time interval to ten minutes before and one minute after the current time.
+        """
+        image_path = self.plot_gong(gong_data, image_time)
+        self.delete_gong_file(gong_file)
+        return image_path
+
 
     
 
@@ -271,8 +480,14 @@ class ObservingLogApp:
         self.db = DatabaseManager(cfg)
 
         self.seeing_var = StringVar(value="Good")
+        self.session_db_var = StringVar(value="")
+
+        if cfg.use_gong:
+            self.gong_plotter = gong_data_plotter(cfg)
+            self.gong_data, self.gong_image_time, self.gong_file = self.gong_plotter.load_gong()
 
         self.create_widgets()
+        self.update_session_db_label()
 
     def create_widgets(self):
         main = Frame(self.root, padx=10, pady=10)
@@ -282,6 +497,9 @@ class ObservingLogApp:
         Label(main, text="Observer").grid(row=0, column=0, sticky="w")
         self.observer_entry = Entry(main, width=40)
         self.observer_entry.grid(row=0, column=1, pady=2)
+
+        if self.cfg.default_observer:
+            self.observer_entry.insert(0, self.cfg.default_observer)
 
         Label(main, text="Telescope").grid(row=1, column=0, sticky="w")
         self.telescope_entry = Entry(main, width=40)
@@ -352,10 +570,57 @@ class ObservingLogApp:
 
         Button(
             btn_frame,
-            text="Add HMI Image",
+            text="Add GONG Image",
             width=15,
-            command=self.add_hmi_image
+            command=self.add_gong_image
         ).pack(side="left", padx=5)
+
+        Button(
+            btn_frame,
+            text="New Session",
+            width=15,
+            command=self.start_new_session
+        ).pack(side="left", padx=5)
+
+        Label(
+            main,
+            textvariable=self.session_db_var,
+            anchor="w"
+        ).grid(row=7, column=0, columnspan=2, sticky="w")
+
+    def update_session_db_label(self):
+        db_display = os.path.abspath(self.db.db_name)
+        self.session_db_var.set(f"Session DB: {db_display}")
+
+    def start_new_session(self):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        initial_name = f"observing_logs_{timestamp}.db"
+
+        new_db = filedialog.asksaveasfilename(
+            title="Create New Session Database",
+            initialfile=initial_name,
+            defaultextension=".db",
+            filetypes=[("SQLite Database", "*.db"), ("All Files", "*.*")],
+        )
+
+        if not new_db:
+            return
+
+        try:
+            self.db.set_database(new_db)
+            self.cfg.DB_NAME = new_db
+            self.update_session_db_label()
+
+            self.target_entry.delete(0, END)
+            self.notes_text.delete("1.0", END)
+            self.seeing_var.set("Good")
+
+            messagebox.showinfo(
+                "New Session",
+                f"Now saving logs to:\n{new_db}"
+            )
+        except Exception as e:
+            messagebox.showerror("Session Error", str(e))
 
 
     def save_log(self):
@@ -443,21 +708,45 @@ class ObservingLogApp:
                 str(e)
             )
 
-    def add_hmi_image(self):
+    def load_gong_image(self):
+        # I want to load the GONG image only once (so it's faster to pull up and plot.)
+        # TODO: later, I'll add a button to update to the latest GONG image.
+
+        if not self.use_gong:
+            return
+
+        try:
+            self.gong_plotter = gong_data_plotter(self.cfg)
+            self.gong_data, self.gong_image_time, self.gong_file = self.gong_plotter.load_gong()
+        except Exception as e:
+            messagebox.showerror("GONG Image Error", str(e))
+    
+    def add_gong_image(self):
         # TODO: Add image-selection workflow (for example, file picker dialog).
         # TODO: Add persistence for image metadata/storage and attach to a log.
-        if not self.cfg.use_HMI:
-            messagebox.showwarning(
-                "HMI Disabled",
-                "HMI functionality is disabled in the current configuration."
+        # Placeholder for future HMI image handling logic
+        try:
+            image_path = self.gong_plotter.plot_and_delete_gong(self.gong_data, self.gong_image_time, self.gong_file)
+
+            attached = self.db.add_image_to_last_log(image_path)
+
+            if not attached:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+                messagebox.showwarning(
+                    "No Logs",
+                    "No existing logs found. Save a log first, then add a GONG image."
+                )
+                return
+
+            messagebox.showinfo(
+                "GONG Image Saved",
+                f"Saved:\n{image_path}\n\n"
+                "Image attached to the most recent log and will be included in PDF export."
             )
-            #return
-        else:
-            # Placeholder for future HMI image handling logic
-            local_time = Time(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            hmi_plotter = HMI_data_plotter(self.cfg, local_time)
-            hmi_plotter.load_and_plot_HMI()
-            
+        except Exception as e:
+            messagebox.showerror("GONG Image Error", str(e))
+        
 
     def view_logs(self):
         rows = self.db.get_all_logs()
@@ -632,6 +921,24 @@ class ObservingLogApp:
                     )
                 )
 
+                image_paths = self.db.get_images_for_log(_id)
+                existing_images = [p for p in image_paths if os.path.exists(p)]
+
+                if existing_images:
+                    content.append(
+                        Paragraph("<b>GONG Images:</b>", styles["Normal"])
+                    )
+
+                    for img_path in existing_images:
+                        content.append(
+                            RLImage(
+                                img_path,
+                                width=2.25 * inch,
+                                height=2.25 * inch,
+                            )
+                        )
+                        content.append(Spacer(1, 6))
+
                 content.append(Spacer(1, 12))
 
             doc.build(content)
@@ -649,8 +956,7 @@ class ObservingLogApp:
 
 
 def main():
-    cfg = Config(use_HMI = False,
-                 default_observer="James Crowley")
+    cfg = Config(default_observer="James Crowley")
 
     root = Tk()
     app = ObservingLogApp(cfg, root)
