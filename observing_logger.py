@@ -282,7 +282,7 @@ class gong_data_plotter:
         print(search_results)
 
         if "0 Providers" in str(search_results):
-            raise FileNotFoundError('No GONG files found for the specified time interval Try running again with "use_gong" mode disabled.')
+            raise FileNotFoundError('No GONG files found for the specified time interval. Try running again with "use_gong" mode disabled.')
 
         path_to_sunpy = "~/sunpy/data/observing_logger/"
 
