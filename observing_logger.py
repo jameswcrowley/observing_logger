@@ -275,20 +275,14 @@ class gong_data_plotter:
         """
         time = Time.now()
         search_results = Fido.search(
-            a.Instrument.bigbear,
+            a.Instrument.bigbear | a.Instrument.learmonth,
             a.Physobs("intensity"),
             a.Time(time - 10 * u.minute, time + 1 * u.minute),
         )
+        print(search_results)
 
-        if len(search_results[0]) == 0:
-            search_results = Fido.search(
-            a.Instrument.learmonth,
-            a.Physobs("intensity"),
-            a.Time(time - 10 * u.minute, time + 1 * u.minute),
-        )
-
-        if len(search_results[0]) == 0:
-            raise FileNotFoundError("No GONG files found for the specified time interval.")
+        if "0 Providers" in str(search_results):
+            raise FileNotFoundError('No GONG files found for the specified time interval Try running again with "use_gong" mode disabled.')
 
         path_to_sunpy = "~/sunpy/data/observing_logger/"
 
@@ -537,46 +531,56 @@ class ObservingLogApp:
         self.notes_text.grid(row=5, column=1, pady=5)
 
         # Buttons
-        btn_frame = Frame(main)
-        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
+        btn_frame_row1 = Frame(main)
+        btn_frame_row1.grid(row=6, column=0, columnspan=2, pady=10)
+        
+        if self.cfg.use_gong:
+            btn_frame_row2 = Frame(main)
+            btn_frame_row2.grid(row=7, column=0, columnspan=2, pady=5)
+            Button(
+                btn_frame_row2,
+                text="Add GONG Image",
+                width=15,
+                command=self.add_gong_image
+            ).pack(side="left", padx=5)
+
+            Button(
+                btn_frame_row2,
+                text="Refresh GONG Image",
+                width=15,
+                command=self.refresh_gong_image
+            ).pack(side="left", padx=5)
 
         Button(
-            btn_frame,
+            btn_frame_row1,
             text="Save Log",
             width=15,
             command=self.save_log
         ).pack(side="left", padx=5)
 
         Button(
-            btn_frame,
+            btn_frame_row1,
             text="Add Note",
             width=15,
             command=self.add_note_to_last_log
         ).pack(side="left", padx=5)
 
         Button(
-            btn_frame,
+            btn_frame_row1,
             text="View Logs",
             width=15,
             command=self.view_logs
         ).pack(side="left", padx=5)
 
         Button(
-            btn_frame,
+            btn_frame_row1,
             text="Export Session PDF",
             width=18,
             command=self.export_pdf
         ).pack(side="left", padx=5)
 
         Button(
-            btn_frame,
-            text="Add GONG Image",
-            width=15,
-            command=self.add_gong_image
-        ).pack(side="left", padx=5)
-
-        Button(
-            btn_frame,
+            btn_frame_row1,
             text="New Session",
             width=15,
             command=self.start_new_session
@@ -586,7 +590,7 @@ class ObservingLogApp:
             main,
             textvariable=self.session_db_var,
             anchor="w"
-        ).grid(row=7, column=0, columnspan=2, sticky="w")
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
 
     def update_session_db_label(self):
         db_display = os.path.abspath(self.db.db_name)
@@ -747,6 +751,17 @@ class ObservingLogApp:
         except Exception as e:
             messagebox.showerror("GONG Image Error", str(e))
         
+
+    def refresh_gong_image(self):
+        try:
+            self.load_gong_image()
+            messagebox.showinfo(
+                "GONG Image Refreshed",
+                "Successfully refreshed the GONG image."
+            )
+        except Exception as e:
+            messagebox.showerror("GONG Image Error", str(e))
+
 
     def view_logs(self):
         rows = self.db.get_all_logs()
@@ -941,6 +956,8 @@ class ObservingLogApp:
 
                 content.append(Spacer(1, 12))
 
+            # TODO: add daily summary here, including total observing time, number of observations, and plot of seeing throughout the day.
+
             doc.build(content)
 
             messagebox.showinfo(
@@ -956,8 +973,7 @@ class ObservingLogApp:
 
 
 def main():
-    cfg = Config(default_observer="James Crowley")
-
+    cfg = Config(default_observer="James Crowley", use_gong=False)
     root = Tk()
     app = ObservingLogApp(cfg, root)
     root.mainloop()
